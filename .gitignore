@@ -3,7 +3,8 @@ venv/
 
 # Generated output
 *.png
-results/
+results/*.csv
+results/window_*.json
 
 # Python cache
 __pycache__/
