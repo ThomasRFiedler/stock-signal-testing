@@ -290,3 +290,234 @@ INDICATORS = [
     (indicator_mcclellan,          1),  # McClellan Oscillator proxy
     (indicator_relative_strength,  1),  # RS vs. S&P 500
 ]
+
+
+# ---------------------------------------------------------------------------
+# Vectorized signal pre-computation
+#
+# Each _vec_* function takes (signals, ctx) and returns an int8 ndarray of
+# shape (n_bars,) with values in {-1, 0, 1} for the full price history.
+# compute_signals_matrix() calls all of them once and stacks the result
+# into a (n_bars, n_indicators) matrix — eliminating the O(n²) per-bar
+# recomputation that was the primary backtest bottleneck.
+# ---------------------------------------------------------------------------
+
+def _daily_to_intraday_pos(signals_index, daily_index):
+    """
+    For each intraday bar, return the integer position of the most recent
+    daily bar whose date <= bar's date. Returns -1 where no daily bar exists.
+    Uses day-precision comparison to avoid timezone ambiguity.
+    """
+    bar_d   = pd.DatetimeIndex(signals_index).values.astype("datetime64[D]")
+    daily_d = pd.DatetimeIndex(daily_index).values.astype("datetime64[D]")
+    pos = np.searchsorted(daily_d, bar_d, side="right") - 1
+    return pos
+
+
+def _vec_sma_cross(signals, ctx):
+    close    = signals["close"]
+    fast_sma = close.rolling(10).mean()
+    slow_sma = close.rolling(30).mean()
+    sig = np.where(fast_sma > slow_sma, 1, np.where(fast_sma < slow_sma, -1, 0))
+    sig[:30] = 0
+    return sig.astype(np.int8)
+
+
+def _vec_rsi(signals, ctx, period=14, overbought=70.0, oversold=30.0):
+    delta    = signals["close"].diff()
+    avg_gain = delta.clip(lower=0).rolling(period).mean()
+    avg_loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    sig = np.where(rsi < oversold, 1, np.where(rsi > overbought, -1, 0))
+    sig[:period] = 0
+    sig = np.where(np.isnan(rsi), 0, sig)
+    return sig.astype(np.int8)
+
+
+def _vec_macd(signals, ctx, fast=12, slow=26, signal_period=9):
+    close       = signals["close"]
+    macd_line   = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    sig = np.where(macd_line > signal_line, 1, np.where(macd_line < signal_line, -1, 0))
+    sig[:slow + signal_period] = 0
+    return sig.astype(np.int8)
+
+
+def _vec_bollinger(signals, ctx, period=20, num_std=2.0):
+    close = signals["close"]
+    mid   = close.rolling(period).mean()
+    std   = close.rolling(period).std()
+    sig   = np.where(close < mid - num_std * std, 1,
+            np.where(close > mid + num_std * std, -1, 0))
+    sig[:period] = 0
+    sig = np.where(np.isnan(mid), 0, sig)
+    return sig.astype(np.int8)
+
+
+def _vec_vwap(signals, ctx):
+    if "volume" not in signals.columns:
+        return np.zeros(len(signals), dtype=np.int8)
+    typical = (signals["high"] + signals["low"] + signals["close"]) / 3.0
+    tv      = typical * signals["volume"]
+    dates   = signals.index.date
+    cum_tv  = tv.groupby(dates).cumsum()
+    cum_vol = signals["volume"].groupby(dates).cumsum()
+    vwap    = np.where(cum_vol > 0, cum_tv / cum_vol, np.nan)
+    close   = signals["close"].values
+    sig     = np.where(np.isnan(vwap), 0,
+              np.where(close < vwap, 1,
+              np.where(close > vwap, -1, 0)))
+    sig[0]  = 0
+    return sig.astype(np.int8)
+
+
+def _vec_obv(signals, ctx, sma_period=10):
+    daily = ctx.get("daily_price")
+    if daily is None or daily.empty or len(daily) < sma_period + 1:
+        return np.zeros(len(signals), dtype=np.int8)
+    d_close = daily["close"].values
+    d_vol   = daily["volume"].values
+    # Vectorised OBV: cumsum of (direction * volume)
+    direction  = np.sign(np.diff(d_close))
+    increments = np.concatenate([[0.0], direction * d_vol[1:]])
+    obv        = np.cumsum(increments)
+    obv_sma    = pd.Series(obv).rolling(sma_period).mean().values
+    pos        = _daily_to_intraday_pos(signals.index, daily.index)
+    valid_pos  = np.clip(pos, 0, len(obv) - 1)
+    obv_vals   = obv[valid_pos]
+    sma_vals   = obv_sma[valid_pos]
+    sig = np.where((pos < 0) | np.isnan(sma_vals), 0,
+          np.where(obv_vals > sma_vals, 1,
+          np.where(obv_vals < sma_vals, -1, 0)))
+    return sig.astype(np.int8)
+
+
+def _vec_volume_surge(signals, ctx, lookback=20, threshold=2.0):
+    if "volume" not in signals.columns:
+        return np.zeros(len(signals), dtype=np.int8)
+    vol      = signals["volume"]
+    avg_vol  = vol.shift(1).rolling(lookback).mean()
+    cur_vol  = vol
+    surge    = cur_vol > threshold * avg_vol
+    price_ch = signals["close"].diff()
+    sig      = np.where(surge & (price_ch > 0), 1,
+               np.where(surge & (price_ch < 0), -1, 0))
+    sig[:lookback] = 0
+    return sig.astype(np.int8)
+
+
+def _vec_vix(signals, ctx, high_threshold=25.0, low_threshold=15.0):
+    vix_df = ctx.get("vix")
+    if vix_df is None or vix_df.empty:
+        return np.zeros(len(signals), dtype=np.int8)
+    pos       = _daily_to_intraday_pos(signals.index, vix_df.index)
+    valid_pos = np.clip(pos, 0, len(vix_df) - 1)
+    vix_vals  = np.where(pos < 0, np.nan, vix_df["close"].values[valid_pos].astype(float))
+    sig = np.where(np.isnan(vix_vals), 0,
+          np.where(vix_vals > high_threshold, 1,
+          np.where(vix_vals < low_threshold, -1, 0)))
+    return sig.astype(np.int8)
+
+
+def _vec_pe_ratio(signals, ctx, high_pe=30.0, low_pe=15.0):
+    pe = ctx.get("fundamentals", {}).get("trailingPE")
+    if pe is None or not isinstance(pe, (int, float)) or np.isnan(pe):
+        return np.zeros(len(signals), dtype=np.int8)
+    val = 1 if pe < low_pe else (-1 if pe > high_pe else 0)
+    return np.full(len(signals), val, dtype=np.int8)
+
+
+def _vec_debt_signaling(signals, ctx, high_dte=150.0, low_dte=50.0):
+    dte = ctx.get("fundamentals", {}).get("debtToEquity")
+    if dte is None or not isinstance(dte, (int, float)) or np.isnan(dte):
+        return np.zeros(len(signals), dtype=np.int8)
+    val = 1 if dte < low_dte else (-1 if dte > high_dte else 0)
+    return np.full(len(signals), val, dtype=np.int8)
+
+
+def _vec_short_interest(signals, ctx, high_ratio=5.0, low_ratio=1.0):
+    sr = ctx.get("fundamentals", {}).get("shortRatio")
+    if sr is None or not isinstance(sr, (int, float)) or np.isnan(sr):
+        return np.zeros(len(signals), dtype=np.int8)
+    val = 1 if sr > high_ratio else (-1 if sr < low_ratio else 0)
+    return np.full(len(signals), val, dtype=np.int8)
+
+
+def _vec_advance_decline(signals, ctx, sma_period=10):
+    spx_daily = ctx.get("spx_daily")
+    if spx_daily is None or spx_daily.empty or len(spx_daily) < sma_period + 1:
+        return np.zeros(len(signals), dtype=np.int8)
+    daily_chg = spx_daily["close"].diff().dropna()
+    ad_line   = np.cumsum(np.sign(daily_chg.values))
+    ad_sma    = pd.Series(ad_line).rolling(sma_period).mean().values
+    pos       = _daily_to_intraday_pos(signals.index, daily_chg.index)
+    valid_pos = np.clip(pos, 0, len(ad_line) - 1)
+    al_vals   = ad_line[valid_pos]
+    sma_vals  = ad_sma[valid_pos]
+    sig = np.where((pos < 0) | np.isnan(sma_vals), 0,
+          np.where(al_vals > sma_vals, 1,
+          np.where(al_vals < sma_vals, -1, 0)))
+    return sig.astype(np.int8)
+
+
+def _vec_mcclellan(signals, ctx):
+    spx_daily = ctx.get("spx_daily")
+    if spx_daily is None or spx_daily.empty or len(spx_daily) < 40:
+        return np.zeros(len(signals), dtype=np.int8)
+    daily_chg = spx_daily["close"].diff().dropna()
+    ad_vals   = pd.Series(np.sign(daily_chg.values), index=daily_chg.index)
+    osc       = ad_vals.ewm(span=19, adjust=False).mean() - ad_vals.ewm(span=39, adjust=False).mean()
+    pos       = _daily_to_intraday_pos(signals.index, osc.index)
+    valid_pos = np.clip(pos, 0, len(osc) - 1)
+    osc_vals  = np.where(pos < 0, np.nan, osc.values[valid_pos].astype(float))
+    sig = np.where(np.isnan(osc_vals), 0,
+          np.where(osc_vals > 0, 1,
+          np.where(osc_vals < 0, -1, 0)))
+    return sig.astype(np.int8)
+
+
+def _vec_relative_strength(signals, ctx, lookback=20):
+    spx_price = ctx.get("spx_price")
+    if spx_price is None or spx_price.empty:
+        return np.zeros(len(signals), dtype=np.int8)
+    ticker_ret  = signals["close"].pct_change(lookback)
+    spx_aligned = spx_price["close"].reindex(signals.index, method="ffill")
+    spx_ret     = spx_aligned.pct_change(lookback)
+    rs  = ticker_ret.values - spx_ret.values
+    sig = np.where(np.isnan(rs), 0, np.where(rs > 0, 1, np.where(rs < 0, -1, 0)))
+    sig[:lookback] = 0
+    return sig.astype(np.int8)
+
+
+# Vectorized functions in the same order as INDICATORS
+_VEC_FUNCTIONS = [
+    _vec_sma_cross,
+    _vec_rsi,
+    _vec_macd,
+    _vec_bollinger,
+    _vec_vwap,
+    _vec_obv,
+    _vec_volume_surge,
+    _vec_vix,
+    _vec_pe_ratio,
+    _vec_debt_signaling,
+    _vec_short_interest,
+    _vec_advance_decline,
+    _vec_mcclellan,
+    _vec_relative_strength,
+]
+
+
+def compute_signals_matrix(signals: pd.DataFrame, ctx: dict) -> np.ndarray:
+    """
+    Pre-compute all indicator signals for the full price history in one pass.
+
+    Returns an int8 array of shape (n_bars, n_indicators). Each column is
+    one indicator (same order as INDICATORS), with values -1, 0, or 1.
+
+    Calling this once before the bar loop eliminates the O(n * per_bar_cost)
+    indicator overhead, reducing the hot loop to a single dot-product lookup.
+    """
+    cols = [fn(signals, ctx) for fn in _VEC_FUNCTIONS]
+    return np.column_stack(cols).astype(np.int8)

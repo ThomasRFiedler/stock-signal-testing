@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 from .data import fetch_data
-from .indicators import INDICATORS
+from .indicators import INDICATORS, _VEC_FUNCTIONS, compute_signals_matrix
 
 
 def backtest(
@@ -102,18 +102,35 @@ def backtest(
     trade_high       = None
     trade_low        = None
 
-    num_bars = len(signals)
-    t_start  = time.perf_counter()
+    num_bars    = len(signals)
+    weights_arr = np.array(effective_weights, dtype=np.float32)
+    t_start     = time.perf_counter()
 
-    # Per-indicator cumulative times (seconds), only populated when verbose=True
-    ind_times = [0.0] * len(INDICATORS)
-
+    # ------------------------------------------------------------------
+    # Pre-compute all indicator signals for every bar in one vectorized
+    # pass, then dot with weights to get a signal_sum array.
+    # The bar loop below becomes O(n) with no indicator function calls.
+    # ------------------------------------------------------------------
     if verbose:
         from tqdm import tqdm
-        bar_iter = tqdm(range(num_bars), desc=f"Backtesting {ticker}", unit="bar",
-                        dynamic_ncols=True)
+        # Time each vectorized indicator individually so the breakdown
+        # reflects pre-computation cost rather than per-bar cost.
+        ind_times = []
+        cols = []
+        for vec_fn in _VEC_FUNCTIONS:
+            t0 = time.perf_counter()
+            cols.append(vec_fn(signals, ctx))
+            ind_times.append(time.perf_counter() - t0)
+        signals_matrix = np.column_stack(cols).astype(np.float32)
+        bar_iter = tqdm(range(num_bars), desc=f"Backtesting {ticker}",
+                        unit="bar", dynamic_ncols=True)
     else:
-        bar_iter = range(num_bars)
+        ind_times      = [0.0] * len(INDICATORS)
+        signals_matrix = compute_signals_matrix(signals, ctx).astype(np.float32)
+        bar_iter       = range(num_bars)
+
+    # Pre-compute weighted signal sums for all bars at once
+    signal_sums = (signals_matrix * weights_arr).sum(axis=1)
 
     for i in bar_iter:
         bar_time  = signals.index[i]
@@ -121,19 +138,8 @@ def backtest(
         bar_high  = signals["high"].iloc[i]
         bar_low   = signals["low"].iloc[i]
 
-        # Step 3 – weighted indicator votes (timed individually when verbose)
-        if verbose:
-            ind_values = []
-            for j, ((ind_func, _), ew) in enumerate(zip(INDICATORS, effective_weights)):
-                t0 = time.perf_counter()
-                ind_values.append(ew * ind_func(signals, i, **ctx))
-                ind_times[j] += time.perf_counter() - t0
-        else:
-            ind_values = [
-                ew * ind_func(signals, i, **ctx)
-                for (ind_func, _), ew in zip(INDICATORS, effective_weights)
-            ]
-        signal_sum = sum(ind_values)
+        # Step 3 – O(1) lookup (vectorised pre-computation above)
+        signal_sum = float(signal_sums[i])
 
         is_last_bar_of_day = (
             i == num_bars - 1
@@ -277,24 +283,22 @@ def backtest(
         print("=" * 60)
 
         # ------------------------------------------------------------------
-        # Indicator timing breakdown
+        # Indicator pre-computation timing breakdown
         # ------------------------------------------------------------------
         total_ind_time = sum(ind_times)
-        print("\n  INDICATOR TIMING BREAKDOWN")
-        print(f"  {'Indicator':<30} {'Total (s)':>10} {'ms/bar':>9} {'Share':>7}")
-        print("  " + "-" * 58)
+        print("\n  INDICATOR PRE-COMPUTATION TIMING")
+        print(f"  {'Indicator':<30} {'Time (s)':>10} {'Share':>7}")
+        print("  " + "-" * 49)
         for (ind_func, _), t in sorted(
             zip(INDICATORS, ind_times), key=lambda x: x[1], reverse=True
         ):
             name = ind_func.__name__.replace("indicator_", "")
             pct  = t / total_ind_time * 100 if total_ind_time > 0 else 0
-            print(f"  {name:<30} {t:>10.3f} {t / num_bars * 1000:>9.3f} {pct:>6.1f}%")
-        print("  " + "-" * 58)
-        print(f"  {'TOTAL (indicators)':<30} {total_ind_time:>10.3f} "
-              f"{total_ind_time / num_bars * 1000:>9.3f} {'100.0%':>7}")
-        other = t_elapsed - total_ind_time
-        print(f"  {'other (loop overhead)':<30} {other:>10.3f} "
-              f"{other / num_bars * 1000:>9.3f}")
+            print(f"  {name:<30} {t:>10.4f} {pct:>6.1f}%")
+        print("  " + "-" * 49)
+        print(f"  {'TOTAL (pre-compute)':<30} {total_ind_time:>10.4f} {'100.0%':>7}")
+        loop_time = t_elapsed - total_ind_time
+        print(f"  {'bar loop (position logic)':<30} {loop_time:>10.4f}")
 
         if total_trades > 0:
             print("\n  TRADE LOG")
