@@ -34,54 +34,71 @@ def cross_validate(
     test_tickers: list,
     time_frame: str = "60d",
     interval: str = "5m",
+    extra_train_tickers: list = None,
     n_generations: int = 200,
     popsize: int = 50,
     position_size: float = 100.0,
     starting_equity: float = 10_000.0,
-    min_trades: int = 5,
+    min_trades: int = 15,
+    reg_lambda: float = 0.01,
+    patience: int = 20,
+    min_delta: float = 0.05,
     preloaded_params: dict = None,
     save_train_params: str = None,
 ) -> pd.DataFrame:
     """
-    Optimize on *train_ticker*, evaluate on each ticker in *test_tickers*.
+    Optimize on *train_ticker* (+ optional extra tickers), evaluate on
+    each ticker in *test_tickers*.
 
     Parameters
     ----------
     train_ticker : str
-        Ticker used for optimization (the "in-sample" instrument).
+        Primary ticker used for optimization (the "in-sample" instrument).
     test_tickers : list[str]
         Tickers to evaluate the optimized parameters on (out-of-sample).
+        Must not overlap with the train ticker(s).
     time_frame : str
         History window: "1w", "60d", or "1y".  Same window used for all
         tickers so they cover the same calendar period.
     interval : str
         Bar interval: "1m", "5m", "15m", "30m", "1h".
+    extra_train_tickers : list[str], optional
+        Additional tickers included in the optimization.  Fitness becomes
+        the average Sharpe across train_ticker + extra_train_tickers.
+        Passing diverse instruments (e.g. ["MSFT", "SPY"]) is the most
+        effective anti-overfitting measure.
     n_generations : int
-        SNES generations for the train-ticker optimization.
+        Maximum SNES generations.  Early stopping may halt sooner.
     popsize : int
         SNES population size.
     position_size : float
     starting_equity : float
     min_trades : int
-        Minimum trades required for a non-penalty fitness score.
+        Minimum trades per training ticker required for non-penalty fitness.
+    reg_lambda : float
+        L2 regularization on indicator weights (default 0.01).
+    patience : int
+        Early stopping patience in generations (default 20).
+    min_delta : float
+        Minimum fitness improvement to reset early-stopping counter.
     preloaded_params : dict, optional
         If provided, skip optimization and use these params directly.
         Expects keys: weights, stop_loss, take_profit, n.
-        Useful when you have already run the optimizer and just want to
-        evaluate generalization.
     save_train_params : str, optional
-        If provided, save the train-ticker optimized params to this path.
+        If provided, save the optimized params to this path.
 
     Returns
     -------
     pd.DataFrame
-        One row per ticker (train ticker first, then test tickers) with
+        One row per ticker (train ticker(s) first, then test tickers) with
         columns: ticker, role, sharpe_ratio, pnl, total_trades,
                  profit_factor, max_drawdown, stop_loss, take_profit, n.
-        Printed summary and returned for further analysis.
     """
+    extra_train = list(extra_train_tickers) if extra_train_tickers else []
+    all_train_tickers = [train_ticker] + extra_train
+
     # ------------------------------------------------------------------
-    # Step 1 – Optimize on train ticker (or use supplied params)
+    # Step 1 – Optimize on train ticker(s) (or use supplied params)
     # ------------------------------------------------------------------
     if preloaded_params is not None:
         opt = preloaded_params
@@ -90,23 +107,26 @@ def cross_validate(
         print(f"  stop_loss={opt['stop_loss']:.4f}  "
               f"take_profit={opt['take_profit']:.4f}  n={opt['n']:.4f}")
     else:
-        print(f"\nFetching training data for {train_ticker} "
-              f"({time_frame} @ {interval})...")
-        train_data = fetch_data(train_ticker, time_frame, interval)
-
-        print(f"Optimizing on {train_ticker} "
-              f"({n_generations} generations × {popsize} population)...")
+        print(f"\nOptimizing on: {all_train_tickers} "
+              f"({time_frame} @ {interval}, "
+              f"{n_generations} generations × {popsize} population)...")
         opt = run_optimization(
-            ticker=train_ticker,
+            train_tickers=all_train_tickers,
             time_frame=time_frame,
             interval=interval,
-            preloaded_data=train_data,
             n_generations=n_generations,
             popsize=popsize,
             position_size=position_size,
             starting_equity=starting_equity,
             min_trades=min_trades,
+            reg_lambda=reg_lambda,
+            patience=patience,
+            min_delta=min_delta,
         )
+        gens = opt.get("generations_run", n_generations)
+        early = " (early stop)" if opt.get("stopped_early") else ""
+        print(f"  Optimization complete: {gens} generations{early}, "
+              f"best fitness={opt['sharpe']:.4f}")
 
         if save_train_params:
             save_params(opt, save_train_params)
@@ -120,11 +140,12 @@ def cross_validate(
     # ------------------------------------------------------------------
     # Step 2 – Evaluate on every ticker (train + test)
     # ------------------------------------------------------------------
-    all_tickers = [train_ticker] + list(test_tickers)
-    records = []
+    train_set   = set(all_train_tickers)
+    all_tickers = all_train_tickers + [t for t in test_tickers if t not in train_set]
+    records     = []
 
     for ticker in all_tickers:
-        role = "TRAIN" if ticker == train_ticker else "TEST"
+        role = "TRAIN" if ticker in train_set else "TEST"
         print(f"\n  [{role}] Fetching and backtesting {ticker}...")
 
         try:
@@ -176,7 +197,7 @@ def cross_validate(
     # ------------------------------------------------------------------
     print("\n" + "=" * 75)
     print(f"  CROSS-TICKER VALIDATION SUMMARY")
-    print(f"  Optimized on: {train_ticker}  |  "
+    print(f"  Optimized on: {all_train_tickers}  |  "
           f"Time frame: {time_frame}  |  Interval: {interval}")
     print(f"  Parameters:  stop_loss={stop_loss:.4f}  "
           f"take_profit={take_profit:.4f}  n={n:.4f}")
@@ -185,7 +206,7 @@ def cross_validate(
           f"{'Trades':>7} {'PF':>6} {'MaxDD ($)':>10}")
     print("  " + "-" * 63)
 
-    train_sharpe = df.loc[df["role"] == "TRAIN", "sharpe_ratio"].iloc[0]
+    train_sharpe = df.loc[df["role"] == "TRAIN", "sharpe_ratio"].mean()
     for _, row in df.iterrows():
         flag = ""
         if row["role"] == "TEST" and not pd.isna(row["sharpe_ratio"]):
