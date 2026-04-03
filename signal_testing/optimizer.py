@@ -69,12 +69,13 @@ class BacktestProblem(Problem):
             evaluated normally. Solutions below this threshold receive
             a penalty fitness of -10.
         """
+        # SNES requires an unbounded problem — it cannot accept hard bounds.
+        # Parameters are clamped to valid ranges inside _evaluate instead.
         super().__init__(
             objective_sense="max",
             solution_length=N_INDICATORS + 3,
             # Start population in the active region to avoid weight collapse.
             initial_bounds=(0.5, 1.5),
-            bounds=(PARAM_LOWER, PARAM_UPPER),
             dtype=torch.float32,
             num_actors=1,   # keep single-process; yahooquery is not fork-safe
         )
@@ -86,41 +87,38 @@ class BacktestProblem(Problem):
         self._starting_equity = starting_equity
         self._min_trades      = min_trades
 
-    def _evaluate(self, solutions):
-        fitnesses = torch.zeros(len(solutions), dtype=torch.float32)
+    def _evaluate(self, solution):
+        # EvoTorch calls _evaluate once per solution (not per batch).
+        # Clamp to valid ranges — SNES is unbounded, bounds are enforced here.
+        params      = solution.values.clamp(PARAM_LOWER, PARAM_UPPER).cpu().tolist()
+        weights     = params[:N_INDICATORS]
+        stop_loss   = params[N_INDICATORS]
+        take_profit = params[N_INDICATORS + 1]
+        n           = params[N_INDICATORS + 2]
 
-        for i in range(len(solutions)):
-            params      = solutions.values[i].cpu().tolist()
-            weights     = params[:N_INDICATORS]
-            stop_loss   = params[N_INDICATORS]
-            take_profit = params[N_INDICATORS + 1]
-            n           = params[N_INDICATORS + 2]
-
-            try:
-                result = backtest(
-                    ticker=self._ticker,
-                    n=n,
-                    time_frame=self._time_frame,
-                    interval=self._interval,
-                    take_profit=take_profit,
-                    stop_loss=stop_loss,
-                    weights=weights,
-                    position_size=self._position_size,
-                    starting_equity=self._starting_equity,
-                    preloaded_data=self._data,
-                    verbose=False,
-                )
-                sharpe = float(result["sharpe_ratio"])
-                if result["total_trades"] < self._min_trades:
-                    sharpe = -10.0
-                if not np.isfinite(sharpe):
-                    sharpe = -10.0
-            except Exception:
+        try:
+            result = backtest(
+                ticker=self._ticker,
+                n=n,
+                time_frame=self._time_frame,
+                interval=self._interval,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                weights=weights,
+                position_size=self._position_size,
+                starting_equity=self._starting_equity,
+                preloaded_data=self._data,
+                verbose=False,
+            )
+            sharpe = float(result["sharpe_ratio"])
+            if result["total_trades"] < self._min_trades:
                 sharpe = -10.0
+            if not np.isfinite(sharpe):
+                sharpe = -10.0
+        except Exception:
+            sharpe = -10.0
 
-            fitnesses[i] = sharpe
-
-        solutions.set_evals(fitnesses)
+        solution.set_evals(sharpe)
 
 
 def run_optimization(
@@ -173,7 +171,8 @@ def run_optimization(
 
     searcher.run(n_generations)
 
-    best_params = searcher.status["best"].values.cpu().tolist()
+    # Clamp to valid ranges — SNES stores the raw (unbounded) sample values
+    best_params = searcher.status["best"].values.clamp(PARAM_LOWER, PARAM_UPPER).cpu().tolist()
     best_sharpe = float(searcher.status["best"].evals)
 
     return {
