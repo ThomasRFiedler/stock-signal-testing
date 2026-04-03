@@ -4,3 +4,4 @@ from .indicators import INDICATORS
 from .optimizer import run_optimization, BacktestProblem
 from .walk_forward import walk_forward_optimize
 from .results import save_params, load_params, load_latest_params
+from .cross_validate import cross_validate
