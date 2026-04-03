@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import pandas as pd
 
@@ -102,18 +103,36 @@ def backtest(
     trade_low        = None
 
     num_bars = len(signals)
+    t_start  = time.perf_counter()
 
-    for i in range(num_bars):
+    # Per-indicator cumulative times (seconds), only populated when verbose=True
+    ind_times = [0.0] * len(INDICATORS)
+
+    if verbose:
+        from tqdm import tqdm
+        bar_iter = tqdm(range(num_bars), desc=f"Backtesting {ticker}", unit="bar",
+                        dynamic_ncols=True)
+    else:
+        bar_iter = range(num_bars)
+
+    for i in bar_iter:
         bar_time  = signals.index[i]
         bar_close = signals["close"].iloc[i]
         bar_high  = signals["high"].iloc[i]
         bar_low   = signals["low"].iloc[i]
 
-        # Step 3 – weighted indicator votes
-        ind_values = [
-            ew * ind_func(signals, i, **ctx)
-            for (ind_func, _), ew in zip(INDICATORS, effective_weights)
-        ]
+        # Step 3 – weighted indicator votes (timed individually when verbose)
+        if verbose:
+            ind_values = []
+            for j, ((ind_func, _), ew) in enumerate(zip(INDICATORS, effective_weights)):
+                t0 = time.perf_counter()
+                ind_values.append(ew * ind_func(signals, i, **ctx))
+                ind_times[j] += time.perf_counter() - t0
+        else:
+            ind_values = [
+                ew * ind_func(signals, i, **ctx)
+                for (ind_func, _), ew in zip(INDICATORS, effective_weights)
+            ]
         signal_sum = sum(ind_values)
 
         is_last_bar_of_day = (
@@ -236,6 +255,8 @@ def backtest(
     # ------------------------------------------------------------------
     # Step 7 – Console output (verbose only)
     # ------------------------------------------------------------------
+    t_elapsed = time.perf_counter() - t_start
+
     if verbose:
         print("=" * 60)
         print(f"  BACKTEST RESULTS  –  {ticker}")
@@ -251,7 +272,29 @@ def backtest(
         print(f"  Max Drawdown     : ${max_drawdown:,.2f}")
         print(f"  Total Trades     : {total_trades}")
         print(f"  Profit Factor    : {profit_factor:.4f}")
+        print(f"  Bars processed   : {num_bars}  ({t_elapsed:.2f}s total, "
+              f"{t_elapsed / num_bars * 1000:.2f}ms/bar)")
         print("=" * 60)
+
+        # ------------------------------------------------------------------
+        # Indicator timing breakdown
+        # ------------------------------------------------------------------
+        total_ind_time = sum(ind_times)
+        print("\n  INDICATOR TIMING BREAKDOWN")
+        print(f"  {'Indicator':<30} {'Total (s)':>10} {'ms/bar':>9} {'Share':>7}")
+        print("  " + "-" * 58)
+        for (ind_func, _), t in sorted(
+            zip(INDICATORS, ind_times), key=lambda x: x[1], reverse=True
+        ):
+            name = ind_func.__name__.replace("indicator_", "")
+            pct  = t / total_ind_time * 100 if total_ind_time > 0 else 0
+            print(f"  {name:<30} {t:>10.3f} {t / num_bars * 1000:>9.3f} {pct:>6.1f}%")
+        print("  " + "-" * 58)
+        print(f"  {'TOTAL (indicators)':<30} {total_ind_time:>10.3f} "
+              f"{total_ind_time / num_bars * 1000:>9.3f} {'100.0%':>7}")
+        other = t_elapsed - total_ind_time
+        print(f"  {'other (loop overhead)':<30} {other:>10.3f} "
+              f"{other / num_bars * 1000:>9.3f}")
 
         if total_trades > 0:
             print("\n  TRADE LOG")

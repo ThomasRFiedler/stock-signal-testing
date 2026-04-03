@@ -10,3 +10,4 @@ matplotlib>=3.7.0
 #   CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.1.0
 evotorch>=0.5.0
+tqdm>=4.65.0
