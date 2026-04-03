@@ -3,6 +3,7 @@ venv/
 
 # Generated output
 *.png
+results/
 
 # Python cache
 __pycache__/

@@ -1077,12 +1077,19 @@ def backtest(
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+# NOTE: This file is kept for reference. The project has been refactored
+# into the signal_testing/ package. Use the following instead:
+#
+#   from signal_testing import backtest
+#   python optimize.py AAPL
+#   python run_walk_forward.py AAPL
+#
 if __name__ == "__main__":
     results = backtest(
         ticker="AAPL",
         n=2,
         time_frame="60d",
         interval="5m",
-        take_profit=0.5,
-        stop_loss=1.0,
+        take_profit=0.02,
+        stop_loss=0.01,
     )

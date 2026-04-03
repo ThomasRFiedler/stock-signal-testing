@@ -1,4 +1,12 @@
-yahooquery
-pandas
-numpy
-matplotlib
+# Core
+yahooquery>=2.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# Evolutionary optimization
+# Install PyTorch separately for your hardware before installing evotorch:
+#   CPU:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0
+evotorch>=0.5.0
