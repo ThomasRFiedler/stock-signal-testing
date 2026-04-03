@@ -21,7 +21,6 @@ stock-signal-testing/
 │   └── results.py           # save/load params, plot_walk_forward()
 ├── optimize.py              # CLI: single-window optimization
 ├── run_walk_forward.py      # CLI: walk-forward optimization
-├── signal-testing.py        # Legacy monolithic file (kept for reference)
 └── requirements.txt
 ```
 
